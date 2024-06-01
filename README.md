@@ -1,2 +1,2 @@
 # scripts
-Useful PowerShell Scripts and Commands
+Useful Scripts and Commands
