@@ -285,143 +285,193 @@ function Invoke-BackupOperation {
             Write-Host "Will proceed without progress indication for this folder." -ForegroundColor Yellow
         }
         
-        # Run robocopy with progress monitoring
-        if ($totalFilesInFolder -gt 0) {
-            Write-Host "Starting copy with progress monitoring..." -ForegroundColor Green
-            
-            # Create a synchronized hashtable to store progress information
-            $progressData = [hashtable]::Synchronized(@{
-                FilesCopied = 0
-                BytesCopied = 0
-                LastUpdate = Get-Date
-                LastFile = ""
-            })
-            
-            # Create a job to run robocopy
-            $job = Start-Job -ScriptBlock {
-                param($src, $dst, $threads, $logFile)
-                robocopy $src $dst /MIR /MT:$threads /R:5 /W:5 `
-                    /XF "desktop.ini" "ntuser.dat*" "NTUSER.DAT*" "*.tmp" `
-                    /XD "AppData\Local\Temp" "AppData\LocalLow" `
-                    /XJ /ZB /BYTES /DCOPY:T /COPY:DAT /LOG+:$logFile
-            } -ArgumentList $sourcePath, $destinationPath, $script:threads, $logFile
-            
-            # Create a job to monitor the log file
-            $monitorJob = Start-Job -ScriptBlock {
-                param($logFile, $progressData)
-                
-                $line = ""
-                $lastPosition = 0
-                
-                # Wait for log file to be created
-                while (!(Test-Path $logFile)) {
-                    Start-Sleep -Milliseconds 100
-                }
-                
-                # Process log file as it grows
-                while ($true) {
-                    try {
-                        $reader = [System.IO.File]::Open($logFile, 'Open', 'Read', 'ReadWrite')
-                        $reader.Position = $lastPosition
-                        $streamReader = New-Object System.IO.StreamReader($reader)
-                        
-                        while (($line = $streamReader.ReadLine()) -ne $null) {
-                            if ($line -match '^\s*\d+\s+\S+') {
-                                # This looks like a file copy line
-                                $progressData.FilesCopied++
-                                
-                                # Try to extract file size
-                                if ($line -match '^\s*\d+\s+(\d+)\s+\S+') {
-                                    $progressData.BytesCopied += [long]$matches[1]
-                                }
-                                
-                                # Extract filename
-                                if ($line -match '\S+$') {
-                                    $progressData.LastFile = $matches[0]
-                                }
-                                
-                                $progressData.LastUpdate = Get-Date
-                            }
-                        }
-                        
-                        $lastPosition = $reader.Position
-                        $streamReader.Close()
-                        $reader.Close()
-                        
-                        # Check if the main job is still running
-                        $jobInfo = Get-Job -Id $args[2]
-                        if ($jobInfo.State -ne 'Running') {
-                            break
-                        }
-                        
-                        Start-Sleep -Milliseconds 250
-                    }
-                    catch {
-                        Start-Sleep -Milliseconds 250
-                    }
-                }
-            } -ArgumentList $logFile, $progressData, $job.Id
-            
-            # Display progress while job is running
-            $startTime = Get-Date
-            
-            while ((Get-Job -Id $job.Id).State -eq 'Running') {
-                $elapsedTime = (Get-Date) - $startTime
-                $elapsedSeconds = [math]::Max(1, $elapsedTime.TotalSeconds)
-                
-                # Calculate progress
-                $percentComplete = [math]::Min(100, [math]::Max(0, [math]::Round(($progressData.FilesCopied / $totalFilesInFolder) * 100, 0)))
-                
-                # Calculate speed
-                $bytesPerSecond = $progressData.BytesCopied / $elapsedSeconds
-                
-                # Format speed for display
-                $speed = if ($bytesPerSecond -gt 1GB) {
-                    "$([math]::Round($bytesPerSecond / 1GB, 2)) GB/s"
-                } elseif ($bytesPerSecond -gt 1MB) {
-                    "$([math]::Round($bytesPerSecond / 1MB, 2)) MB/s"
-                } else {
-                    "$([math]::Round($bytesPerSecond / 1KB, 2)) KB/s"
-                }
-                
-                # Calculate ETA
-                $eta = "Calculating..."
-                if ($percentComplete -gt 0) {
-                    $totalSecondsRemaining = ($elapsedSeconds / $percentComplete) * (100 - $percentComplete)
-                    $timeRemaining = [timespan]::FromSeconds($totalSecondsRemaining)
-                    $eta = "{0:hh\:mm\:ss}" -f $timeRemaining
-                }
-                
-                # Progress bar
-                $status = "$($progressData.FilesCopied) of $totalFilesInFolder files | $speed | ETA: $eta"
-                
-                # Create a progress bar
-                $progressBarWidth = 50
-                $filledWidth = [math]::Round(($percentComplete / 100) * $progressBarWidth)
-                $progressBar = "[" + ("#" * $filledWidth) + (" " * ($progressBarWidth - $filledWidth)) + "]"
-                
-                Write-Host "`r$progressBar $percentComplete% $status     " -NoNewline
-                
-                Start-Sleep -Milliseconds 500
-            }
-            
-            # Complete the progress line
-            Write-Host "`r" + (" " * 120) + "`r" -NoNewline
-            
-            # Get job output and clean up
-            $robocopyOutput = @(Receive-Job -Id $job.Id)
-            Remove-Job -Id $job.Id -Force
-            Remove-Job -Id $monitorJob.Id -Force
-            
-            Write-Host "Copy operation completed for $folder" -ForegroundColor Green
+# This is a replacement for the progress monitoring section in both backup and restore functions
+
+# Run robocopy with progress monitoring - IMPROVED VERSION
+if ($totalFilesInFolder -gt 0) {
+    Write-Host "Starting copy with progress monitoring..." -ForegroundColor Green
+    
+    # Use a temporary file to store robocopy output for live monitoring
+    $tempOutputFile = [System.IO.Path]::GetTempFileName()
+    
+    # Start robocopy as a process so we can monitor it in real-time
+    $processStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $processStartInfo.FileName = "robocopy.exe"
+    $processStartInfo.Arguments = "`"$sourcePath`" `"$destinationPath`" /MIR /MT:$script:threads /R:5 /W:5 " +
+                                  "/XF `"desktop.ini`" `"ntuser.dat*`" `"NTUSER.DAT*`" `"*.tmp`" " +
+                                  "/XD `"AppData\Local\Temp`" `"AppData\LocalLow`" " +
+                                  "/XJ /Z /BYTES /DCOPY:T /COPY:DAT /LOG+:`"$logFile`" /TEE /NP"
+    $processStartInfo.RedirectStandardOutput = $true
+    $processStartInfo.RedirectStandardError = $true
+    $processStartInfo.UseShellExecute = $false
+    $processStartInfo.CreateNoWindow = $true
+    
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $processStartInfo
+    $process.EnableRaisingEvents = $true
+    
+    # Setup output handlers
+    $outputBuilder = New-Object System.Text.StringBuilder
+    $errorBuilder = New-Object System.Text.StringBuilder
+    
+    $filesCopied = 0
+    $lastReportedFiles = 0
+    $bytesTransferred = 0
+    $copyComplete = $false
+    
+    # Register output event handler
+    $outputHandler = {
+        if ($EventArgs.Data -match '^\s*(\d+)\s+(\S.+)') {
+            # This is likely a file being copied
+            $filesCopied++
         }
-        else {
-            # Fallback to standard robocopy if we couldn't calculate file count
-            $robocopyOutput = @(robocopy $sourcePath $destinationPath /MIR /MT:$script:threads /R:5 /W:5 `
-                /XF "desktop.ini" "ntuser.dat*" "NTUSER.DAT*" "*.tmp" `
-                /XD "AppData\Local\Temp" "AppData\LocalLow" `
-                /XJ /ZB /NP /BYTES /DCOPY:T /COPY:DAT /LOG+:$logFile /TEE)
+        elseif ($EventArgs.Data -match 'Files\s*:\s*(\d+)') {
+            # This is the summary line with total files copied
+            $filesCopied = [int]$Matches[1]
         }
+        elseif ($EventArgs.Data -match 'Bytes\s*:\s*(\d+)') {
+            # This is the summary line with total bytes transferred
+            $bytesTransferred = [int64]$Matches[1]
+        }
+        elseif ($EventArgs.Data -match 'Speed\s*:\s*(.+)') {
+            # This contains the transfer speed
+            $transferSpeed = $Matches[1]
+        }
+
+        # Save to the output builder
+        [void]$outputBuilder.AppendLine($EventArgs.Data)
+    }
+    
+    $errorHandler = {
+        [void]$errorBuilder.AppendLine($EventArgs.Data)
+    }
+    
+    $processExitedHandler = {
+        $copyComplete = $true
+    }
+    
+    # Register the event handlers
+    $outputEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action $outputHandler
+    $errorEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action $errorHandler
+    $exitedEvent = Register-ObjectEvent -InputObject $process -EventName Exited -Action $processExitedHandler
+    
+    # Start the process
+    [void]$process.Start()
+    $process.BeginOutputReadLine()
+    $process.BeginErrorReadLine()
+    
+    # Monitor progress
+    $startTime = Get-Date
+    $spinChars = '|', '/', '-', '\'
+    $spinIndex = 0
+    
+    while (-not $copyComplete) {
+        $elapsedTime = (Get-Date) - $startTime
+        $elapsedSeconds = [math]::Max(1, $elapsedTime.TotalSeconds)
+        
+        # Calculate progress based on file count
+        if ($filesCopied -gt $lastReportedFiles) {
+            $lastReportedFiles = $filesCopied
+        }
+        
+        $percentComplete = [math]::Min(100, [math]::Max(0, [math]::Round(($filesCopied / $totalFilesInFolder) * 100, 0)))
+        
+        # Create a spinner for activity indication even when no progress is visible
+        $spinChar = $spinChars[$spinIndex % $spinChars.Length]
+        $spinIndex++
+        
+        # Format status line - include spinner to show activity
+        $status = "$spinChar $filesCopied of $totalFilesInFolder files"
+        
+        # Add transfer rate if available
+        if ($bytesTransferred -gt 0) {
+            $rate = [math]::Round($bytesTransferred / $elapsedSeconds / 1MB, 2)
+            $status += " | $rate MB/s"
+        }
+        
+        # Calculate ETA if we have progress
+        if ($percentComplete -gt 0) {
+            $totalSecondsRemaining = ($elapsedSeconds / $percentComplete) * (100 - $percentComplete)
+            $timeRemaining = [timespan]::FromSeconds($totalSecondsRemaining)
+            $eta = "{0:hh\:mm\:ss}" -f $timeRemaining
+            $status += " | ETA: $eta"
+        }
+        
+        # Create a progress bar
+        $progressBarWidth = 50
+        $filledWidth = [math]::Round(($percentComplete / 100) * $progressBarWidth)
+        $progressBar = "[" + ("#" * $filledWidth) + (" " * ($progressBarWidth - $filledWidth)) + "]"
+        
+        Write-Host "`r$progressBar $percentComplete% $status     " -NoNewline
+        
+        Start-Sleep -Milliseconds 200
+        
+        # Check if process has exited
+        if ($process.HasExited) {
+            $copyComplete = $true
+        }
+    }
+    
+    # Complete the progress line
+    Write-Host "`r" + (" " * 120) + "`r" -NoNewline
+    
+    # Cleanup events
+    Unregister-Event -SourceIdentifier $outputEvent.Name
+    Unregister-Event -SourceIdentifier $errorEvent.Name
+    Unregister-Event -SourceIdentifier $exitedEvent.Name
+    
+    # Get the final output and cleanup
+    $output = $outputBuilder.ToString()
+    $errorOutput = $errorBuilder.ToString()
+    
+    # Wait for process to fully exit
+    $process.WaitForExit()
+    
+    # Get exit code
+    $robocopyExitCode = $process.ExitCode
+    
+    # Cleanup
+    $process.Close()
+    
+    Write-Host "Copy operation completed for $folder" -ForegroundColor Green
+    
+    # Try to extract statistics from output
+    try {
+        if ($output -match "Files\s*:\s*(\d+)") {
+            $totalFilesCopied += [int]$Matches[1]
+        }
+        
+        if ($output -match "Bytes\s*:\s*(\d+)") {
+            $totalBytesCopied += [int64]$Matches[1]
+        }
+    }
+    catch {
+        Write-Host "Error parsing robocopy output: $_" -ForegroundColor Yellow
+    }
+}
+else {
+    # Fallback to standard robocopy if we couldn't calculate file count
+    $robocopyProcess = Start-Process -FilePath "robocopy.exe" -ArgumentList @(
+        "`"$sourcePath`"",
+        "`"$destinationPath`"",
+        "/MIR",
+        "/MT:$script:threads",
+        "/R:5",
+        "/W:5",
+        "/XF", "desktop.ini", "ntuser.dat*", "NTUSER.DAT*", "*.tmp",
+        "/XD", "AppData\Local\Temp", "AppData\LocalLow",
+        "/XJ",
+        "/ZB",
+        "/NP",
+        "/BYTES",
+        "/DCOPY:T",
+        "/COPY:DAT",
+        "/LOG+:`"$logFile`"",
+        "/TEE"
+    ) -NoNewWindow -Wait -PassThru
+    
+    $robocopyExitCode = $robocopyProcess.ExitCode
+}
         
         # Save the last exit code before it gets overwritten
         $robocopyExitCode = $LASTEXITCODE
@@ -693,145 +743,193 @@ $sizeToRestoreGB = [math]::Round($totalSizeToRestore / 1GB, 2)
             Write-Host "Will proceed without progress indication for this folder." -ForegroundColor Yellow
         }
         
-        # Run robocopy with progress monitoring
-        if ($totalFilesInFolder -gt 0) {
-            # Add the /MON:1 parameter to make robocopy output each file copied
-            # We'll hide this output but count it for progress
-            
-            Write-Host "Starting restore with progress monitoring..." -ForegroundColor Green
-            
-            # Create a synchronized hashtable to store progress information
-            $progressData = [hashtable]::Synchronized(@{
-                FilesCopied = 0
-                BytesCopied = 0
-                LastUpdate = Get-Date
-                LastFile = ""
-            })
-            
-            # Create a job to run robocopy
-            $job = Start-Job -ScriptBlock {
-                param($src, $dst, $threads, $logFile)
-                robocopy $src $dst /MIR /MT:$threads /R:5 /W:5 `
-                    /XF "desktop.ini" "ntuser.dat*" "NTUSER.DAT*" "*.tmp" `
-                    /XJ /ZB /BYTES /DCOPY:T /COPY:DAT /LOG+:$logFile
-            } -ArgumentList $sourcePath, $destinationPath, $script:threads, $logFile
-            
-            # Create a job to monitor the log file
-            $monitorJob = Start-Job -ScriptBlock {
-                param($logFile, $progressData)
-                
-                $line = ""
-                $lastPosition = 0
-                
-                # Wait for log file to be created
-                while (!(Test-Path $logFile)) {
-                    Start-Sleep -Milliseconds 100
-                }
-                
-                # Process log file as it grows
-                while ($true) {
-                    try {
-                        $reader = [System.IO.File]::Open($logFile, 'Open', 'Read', 'ReadWrite')
-                        $reader.Position = $lastPosition
-                        $streamReader = New-Object System.IO.StreamReader($reader)
-                        
-                        while (($line = $streamReader.ReadLine()) -ne $null) {
-                            if ($line -match '^\s*\d+\s+\S+') {
-                                # This looks like a file copy line
-                                $progressData.FilesCopied++
-                                
-                                # Try to extract file size
-                                if ($line -match '^\s*\d+\s+(\d+)\s+\S+') {
-                                    $progressData.BytesCopied += [long]$matches[1]
-                                }
-                                
-                                # Extract filename
-                                if ($line -match '\S+$') {
-                                    $progressData.LastFile = $matches[0]
-                                }
-                                
-                                $progressData.LastUpdate = Get-Date
-                            }
-                        }
-                        
-                        $lastPosition = $reader.Position
-                        $streamReader.Close()
-                        $reader.Close()
-                        
-                        # Check if the main job is still running
-                        $jobInfo = Get-Job -Id $args[2]
-                        if ($jobInfo.State -ne 'Running') {
-                            break
-                        }
-                        
-                        Start-Sleep -Milliseconds 250
-                    }
-                    catch {
-                        Start-Sleep -Milliseconds 250
-                    }
-                }
-            } -ArgumentList $logFile, $progressData, $job.Id
-			
-# Display progress while job is running
-            $activity = "Restoring $folder"
-            $startTime = Get-Date
-            
-            while ((Get-Job -Id $job.Id).State -eq 'Running') {
-                $elapsedTime = (Get-Date) - $startTime
-                $elapsedSeconds = [math]::Max(1, $elapsedTime.TotalSeconds)
-                
-                # Calculate progress
-                $percentComplete = [math]::Min(100, [math]::Max(0, [math]::Round(($progressData.FilesCopied / $totalFilesInFolder) * 100, 0)))
-                
-                # Calculate speed
-                $bytesPerSecond = $progressData.BytesCopied / $elapsedSeconds
-                
-                # Format speed for display
-                $speed = if ($bytesPerSecond -gt 1GB) {
-                    "$([math]::Round($bytesPerSecond / 1GB, 2)) GB/s"
-                } elseif ($bytesPerSecond -gt 1MB) {
-                    "$([math]::Round($bytesPerSecond / 1MB, 2)) MB/s"
-                } else {
-                    "$([math]::Round($bytesPerSecond / 1KB, 2)) KB/s"
-                }
-                
-                # Calculate ETA
-                $eta = "Calculating..."
-                if ($percentComplete -gt 0) {
-                    $totalSecondsRemaining = ($elapsedSeconds / $percentComplete) * (100 - $percentComplete)
-                    $timeRemaining = [timespan]::FromSeconds($totalSecondsRemaining)
-                    $eta = "{0:hh\:mm\:ss}" -f $timeRemaining
-                }
-                
-                # Status line
-                $status = "$($progressData.FilesCopied) of $totalFilesInFolder files | $speed | ETA: $eta"
-                
-                # Create a progress bar
-                $progressBarWidth = 50
-                $filledWidth = [math]::Round(($percentComplete / 100) * $progressBarWidth)
-                $progressBar = "[" + ("#" * $filledWidth) + (" " * ($progressBarWidth - $filledWidth)) + "]"
-                
-                Write-Host "`r$progressBar $percentComplete% $status     " -NoNewline
-                
-                Start-Sleep -Milliseconds 500
-            }
-            
-            # Complete the progress line
-            Write-Host "`r" + (" " * 120) + "`r" -NoNewline
-            
-            # Get job output and clean up
-            $robocopyOutput = @(Receive-Job -Id $job.Id)
-            Remove-Job -Id $job.Id -Force
-            Remove-Job -Id $monitorJob.Id -Force
-            
-            Write-Host "Restore operation completed for $folder" -ForegroundColor Green
+# This is a replacement for the progress monitoring section in both backup and restore functions
+
+# Run robocopy with progress monitoring - IMPROVED VERSION
+if ($totalFilesInFolder -gt 0) {
+    Write-Host "Starting copy with progress monitoring..." -ForegroundColor Green
+    
+    # Use a temporary file to store robocopy output for live monitoring
+    $tempOutputFile = [System.IO.Path]::GetTempFileName()
+    
+    # Start robocopy as a process so we can monitor it in real-time
+    $processStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $processStartInfo.FileName = "robocopy.exe"
+    $processStartInfo.Arguments = "`"$sourcePath`" `"$destinationPath`" /MIR /MT:$script:threads /R:5 /W:5 " +
+                                  "/XF `"desktop.ini`" `"ntuser.dat*`" `"NTUSER.DAT*`" `"*.tmp`" " +
+                                  "/XD `"AppData\Local\Temp`" `"AppData\LocalLow`" " +
+                                  "/XJ /Z /BYTES /DCOPY:T /COPY:DAT /LOG+:`"$logFile`" /TEE /NP"
+    $processStartInfo.RedirectStandardOutput = $true
+    $processStartInfo.RedirectStandardError = $true
+    $processStartInfo.UseShellExecute = $false
+    $processStartInfo.CreateNoWindow = $true
+    
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $processStartInfo
+    $process.EnableRaisingEvents = $true
+    
+    # Setup output handlers
+    $outputBuilder = New-Object System.Text.StringBuilder
+    $errorBuilder = New-Object System.Text.StringBuilder
+    
+    $filesCopied = 0
+    $lastReportedFiles = 0
+    $bytesTransferred = 0
+    $copyComplete = $false
+    
+    # Register output event handler
+    $outputHandler = {
+        if ($EventArgs.Data -match '^\s*(\d+)\s+(\S.+)') {
+            # This is likely a file being copied
+            $filesCopied++
         }
-        else {
-            # Fallback to standard robocopy if we couldn't calculate file count
-            $robocopyOutput = @(robocopy $sourcePath $destinationPath /MIR /MT:$script:threads /R:5 /W:5 `
-                /XF "desktop.ini" "ntuser.dat*" "NTUSER.DAT*" "*.tmp" `
-                /XJ /ZB /NP /BYTES /DCOPY:T /COPY:DAT /LOG+:$logFile /TEE)
+        elseif ($EventArgs.Data -match 'Files\s*:\s*(\d+)') {
+            # This is the summary line with total files copied
+            $filesCopied = [int]$Matches[1]
         }
+        elseif ($EventArgs.Data -match 'Bytes\s*:\s*(\d+)') {
+            # This is the summary line with total bytes transferred
+            $bytesTransferred = [int64]$Matches[1]
+        }
+        elseif ($EventArgs.Data -match 'Speed\s*:\s*(.+)') {
+            # This contains the transfer speed
+            $transferSpeed = $Matches[1]
+        }
+
+        # Save to the output builder
+        [void]$outputBuilder.AppendLine($EventArgs.Data)
+    }
+    
+    $errorHandler = {
+        [void]$errorBuilder.AppendLine($EventArgs.Data)
+    }
+    
+    $processExitedHandler = {
+        $copyComplete = $true
+    }
+    
+    # Register the event handlers
+    $outputEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action $outputHandler
+    $errorEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action $errorHandler
+    $exitedEvent = Register-ObjectEvent -InputObject $process -EventName Exited -Action $processExitedHandler
+    
+    # Start the process
+    [void]$process.Start()
+    $process.BeginOutputReadLine()
+    $process.BeginErrorReadLine()
+    
+    # Monitor progress
+    $startTime = Get-Date
+    $spinChars = '|', '/', '-', '\'
+    $spinIndex = 0
+    
+    while (-not $copyComplete) {
+        $elapsedTime = (Get-Date) - $startTime
+        $elapsedSeconds = [math]::Max(1, $elapsedTime.TotalSeconds)
+        
+        # Calculate progress based on file count
+        if ($filesCopied -gt $lastReportedFiles) {
+            $lastReportedFiles = $filesCopied
+        }
+        
+        $percentComplete = [math]::Min(100, [math]::Max(0, [math]::Round(($filesCopied / $totalFilesInFolder) * 100, 0)))
+        
+        # Create a spinner for activity indication even when no progress is visible
+        $spinChar = $spinChars[$spinIndex % $spinChars.Length]
+        $spinIndex++
+        
+        # Format status line - include spinner to show activity
+        $status = "$spinChar $filesCopied of $totalFilesInFolder files"
+        
+        # Add transfer rate if available
+        if ($bytesTransferred -gt 0) {
+            $rate = [math]::Round($bytesTransferred / $elapsedSeconds / 1MB, 2)
+            $status += " | $rate MB/s"
+        }
+        
+        # Calculate ETA if we have progress
+        if ($percentComplete -gt 0) {
+            $totalSecondsRemaining = ($elapsedSeconds / $percentComplete) * (100 - $percentComplete)
+            $timeRemaining = [timespan]::FromSeconds($totalSecondsRemaining)
+            $eta = "{0:hh\:mm\:ss}" -f $timeRemaining
+            $status += " | ETA: $eta"
+        }
+        
+        # Create a progress bar
+        $progressBarWidth = 50
+        $filledWidth = [math]::Round(($percentComplete / 100) * $progressBarWidth)
+        $progressBar = "[" + ("#" * $filledWidth) + (" " * ($progressBarWidth - $filledWidth)) + "]"
+        
+        Write-Host "`r$progressBar $percentComplete% $status     " -NoNewline
+        
+        Start-Sleep -Milliseconds 200
+        
+        # Check if process has exited
+        if ($process.HasExited) {
+            $copyComplete = $true
+        }
+    }
+    
+    # Complete the progress line
+    Write-Host "`r" + (" " * 120) + "`r" -NoNewline
+    
+    # Cleanup events
+    Unregister-Event -SourceIdentifier $outputEvent.Name
+    Unregister-Event -SourceIdentifier $errorEvent.Name
+    Unregister-Event -SourceIdentifier $exitedEvent.Name
+    
+    # Get the final output and cleanup
+    $output = $outputBuilder.ToString()
+    $errorOutput = $errorBuilder.ToString()
+    
+    # Wait for process to fully exit
+    $process.WaitForExit()
+    
+    # Get exit code
+    $robocopyExitCode = $process.ExitCode
+    
+    # Cleanup
+    $process.Close()
+    
+    Write-Host "Copy operation completed for $folder" -ForegroundColor Green
+    
+    # Try to extract statistics from output
+    try {
+        if ($output -match "Files\s*:\s*(\d+)") {
+            $totalFilesCopied += [int]$Matches[1]
+        }
+        
+        if ($output -match "Bytes\s*:\s*(\d+)") {
+            $totalBytesCopied += [int64]$Matches[1]
+        }
+    }
+    catch {
+        Write-Host "Error parsing robocopy output: $_" -ForegroundColor Yellow
+    }
+}
+else {
+    # Fallback to standard robocopy if we couldn't calculate file count
+    $robocopyProcess = Start-Process -FilePath "robocopy.exe" -ArgumentList @(
+        "`"$sourcePath`"",
+        "`"$destinationPath`"",
+        "/MIR",
+        "/MT:$script:threads",
+        "/R:5",
+        "/W:5",
+        "/XF", "desktop.ini", "ntuser.dat*", "NTUSER.DAT*", "*.tmp",
+        "/XD", "AppData\Local\Temp", "AppData\LocalLow",
+        "/XJ",
+        "/ZB",
+        "/NP",
+        "/BYTES",
+        "/DCOPY:T",
+        "/COPY:DAT",
+        "/LOG+:`"$logFile`"",
+        "/TEE"
+    ) -NoNewWindow -Wait -PassThru
+    
+    $robocopyExitCode = $robocopyProcess.ExitCode
+}
         
         # Save the last exit code before it gets overwritten
         $robocopyExitCode = $LASTEXITCODE
