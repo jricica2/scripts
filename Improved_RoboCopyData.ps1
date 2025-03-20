@@ -35,8 +35,15 @@ function Show-FolderSelectionMenu {
         [array]$FolderOptions
     )
     
+    # Initialize arrays to avoid null array issues
     $selectedFolders = @()
     $menuOptions = @{}
+    
+    # Safety check for empty folder options
+    if ($null -eq $FolderOptions -or $FolderOptions.Count -eq 0) {
+        Write-Host "No folders available for selection." -ForegroundColor Red
+        return @()
+    }
     
     for ($i=0; $i -lt $FolderOptions.Count; $i++) {
         $menuOptions.Add(($i+1), $FolderOptions[$i])
@@ -61,7 +68,7 @@ function Show-FolderSelectionMenu {
         $choice = Read-Host "`nEnter your choice"
         
         if ($choice -eq "A" -or $choice -eq "a") {
-            $selectedFolders = $menuOptions.Values
+            $selectedFolders = @($menuOptions.Values)
         }
         elseif ($choice -eq "N" -or $choice -eq "n") {
             $selectedFolders = @()
@@ -76,7 +83,7 @@ function Show-FolderSelectionMenu {
         elseif ($menuOptions.ContainsKey([int]$choice)) {
             $folder = $menuOptions[[int]$choice]
             if ($selectedFolders -contains $folder) {
-                $selectedFolders = $selectedFolders | Where-Object { $_ -ne $folder }
+                $selectedFolders = @($selectedFolders | Where-Object { $_ -ne $folder })
             } else {
                 $selectedFolders += $folder
             }
@@ -95,8 +102,7 @@ $defaultFolders = @(
     "Videos",
     "Music",
     "Favorites",
-    "OneDrive",
-    "AppData\Roaming"
+    "OneDrive"
 )
 
 # Get the user profile path
@@ -105,12 +111,23 @@ $userProfile = [System.Environment]::GetFolderPath("UserProfile")
 # Ask for destination drive/path
 Write-Host "=== BACKUP DESTINATION ===" -ForegroundColor Cyan
 Write-Host "Available drives:" -ForegroundColor Yellow
-$drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -gt 0 }
+$drives = @(Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -gt 0 })
+if ($drives.Count -eq 0) {
+    Write-Host "No available drives found." -ForegroundColor Red
+    exit 1
+}
+
 foreach ($drive in $drives) {
-    $freeGB = [math]::Round($drive.Free / 1GB, 2)
+    # Safely calculate free space
+    $freeGB = 0
+    if ($null -ne $drive.Free) {
+        $freeGB = [math]::Round($drive.Free / 1GB, 2)
+    }
     Write-Host "$($drive.Name): - $($drive.Description) - $freeGB GB free"
 }
 
+$validPath = $false
+$externalDrive = ""
 do {
     $driveLetter = Read-Host "`nEnter drive letter for backup destination (e.g., D)"
     
@@ -147,7 +164,7 @@ do {
 
 # Show folder selection menu
 Write-Host "`nSelect folders to back up:"
-$foldersToCopy = Show-FolderSelectionMenu -FolderOptions $defaultFolders
+$foldersToCopy = @(Show-FolderSelectionMenu -FolderOptions $defaultFolders)
 
 if ($foldersToCopy.Count -eq 0) {
     Write-Host "No folders selected for backup. Operation cancelled." -ForegroundColor Yellow
@@ -156,6 +173,7 @@ if ($foldersToCopy.Count -eq 0) {
 
 # Ask for the number of threads to use
 $defaultThreads = 16
+$threads = $defaultThreads
 do {
     $threadsInput = Read-Host "`nEnter number of threads to use for copying (default: $defaultThreads)"
     if ($threadsInput -eq "") {
@@ -226,62 +244,72 @@ foreach ($folder in $foldersToCopy) {
     # Run RoboCopy with improved parameters
     Write-Host "`nCopying $folder..." -ForegroundColor Cyan
     
-    # Robocopy parameters:
-    # /MIR - Mirror mode (equivalent to /E /PURGE)
-    # /MT:n - Multithreaded copying with n threads
-    # /R:n - Number of retries on failed copies
-    # /W:n - Wait time between retries
-    # /XF - Exclude files matching the specified names/paths/wildcards
-    # /XD - Exclude directories matching the specified names/paths
-    # /XJ - Exclude junction points
-    # /B - Backup mode (allows copying of files that require admin privileges)
-    # /ZB - Use restartable mode; if access denied use backup mode
-    # /NP - No progress (reduces log size)
-    # /NFL - No file list (reduces log size)
-    # /NDL - No directory list (reduces log size)
-    # /TEE - Output to console and log file
-    # /BYTES - Show file sizes in bytes
-    # /DCOPY:T - Copy directory timestamps
-    # /COPY:DAT - Copy data, attributes, and timestamps (excludes security info for speed)
-    
-    $result = robocopy $sourcePath $destinationPath /MIR /MT:$threads /R:5 /W:5 `
+    # Run robocopy and capture output
+    # Convert output to array to avoid null array issues
+    $robocopyOutput = @(robocopy $sourcePath $destinationPath /MIR /MT:$threads /R:5 /W:5 `
         /XF "desktop.ini" "ntuser.dat*" "NTUSER.DAT*" "*.tmp" `
         /XD "AppData\Local\Temp" "AppData\LocalLow" `
-        /XJ /ZB /NP /BYTES /DCOPY:T /COPY:DAT /LOG+:$logFile /TEE
+        /XJ /ZB /NP /BYTES /DCOPY:T /COPY:DAT /LOG+:$logFile /TEE)
+    
+    # Save the last exit code before it gets overwritten
+    $robocopyExitCode = $LASTEXITCODE
+    
+    # Safely extract statistics from output
+    try {
+        $fileStats = $robocopyOutput | Select-String -Pattern "Files :" -SimpleMatch
+        $byteStats = $robocopyOutput | Select-String -Pattern "Bytes :" -SimpleMatch
+        
+        if ($fileStats) {
+            $fileMatch = $fileStats -match "Files :\s*(\d+)"
+            if ($fileMatch -and $Matches -and $Matches[1]) {
+                $totalFilesCopied += [int]$Matches[1]
+            }
+        }
+        
+        if ($byteStats) {
+            $byteMatch = $byteStats -match "Bytes :\s*(\d+)"
+            if ($byteMatch -and $Matches -and $Matches[1]) {
+                $totalBytesCopied += [int64]$Matches[1]
+            }
+        }
+    }
+    catch {
+        Write-Host "Error parsing robocopy output: $_" -ForegroundColor Yellow
+    }
     
     # Evaluate the robocopy exit code
     # See https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/robocopy-exit-codes
-    switch ($LASTEXITCODE) {
+    switch ($robocopyExitCode) {
         0 { Write-Host "No files were copied for $folder. Source and destination are synchronized." -ForegroundColor Green }
-        1 { 
-            Write-Host "Files were copied successfully for $folder." -ForegroundColor Green 
-            # Try to parse robocopy output for statistics - might need adjustment based on your locale
-            if ($result -match "Files : \s*(\d+)") { $totalFilesCopied += [int]$Matches[1] }
-            if ($result -match "Bytes : \s*(\d+)") { $totalBytesCopied += [int64]$Matches[1] }
-        }
+        1 { Write-Host "Files were copied successfully for $folder." -ForegroundColor Green }
         2 { Write-Host "Extra files or directories were detected in $folder." -ForegroundColor Yellow }
-        3 { 
-            Write-Host "Some files were copied, some failed for $folder." -ForegroundColor Yellow 
-            # Try to parse robocopy output for statistics
-            if ($result -match "Files : \s*(\d+)") { $totalFilesCopied += [int]$Matches[1] }
-            if ($result -match "Bytes : \s*(\d+)") { $totalBytesCopied += [int64]$Matches[1] }
-        }
+        3 { Write-Host "Some files were copied, some failed for $folder." -ForegroundColor Yellow }
         {$_ -ge 8} { 
             Write-Host "At least one failure occurred during copying of $folder." -ForegroundColor Red
             if ($_ -band 8) { Write-Host "Some files or directories could not be copied (copy errors occurred)." -ForegroundColor Red }
             if ($_ -band 16) { Write-Host "Serious error - robocopy did not copy any files." -ForegroundColor Red }
         }
-        default { Write-Host "Completed with return code $LASTEXITCODE" -ForegroundColor Yellow }
+        default { Write-Host "Completed with return code $robocopyExitCode" -ForegroundColor Yellow }
     }
 }
 
-# Calculate and display total backup size
+# Calculate and display total backup size - using safer methods
 $totalSize = 0
 foreach ($folder in $foldersToCopy) {
     $folderPath = Join-Path -Path $externalDrive -ChildPath $folder
     if (Test-Path -Path $folderPath) {
-        $size = (Get-ChildItem -Path $folderPath -Recurse -File | Measure-Object -Property Length -Sum).Sum
-        $totalSize += $size
+        try {
+            $folderFiles = @(Get-ChildItem -Path $folderPath -Recurse -File -ErrorAction SilentlyContinue)
+            if ($folderFiles.Count -gt 0) {
+                $folderSize = ($folderFiles | Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
+                if ($null -ne $folderSize) {
+                    $totalSize += $folderSize
+                }
+            }
+        } 
+        catch {
+            Write-Host "Error calculating size for $folder : $_" -ForegroundColor Yellow
+        }
     }
 }
 
