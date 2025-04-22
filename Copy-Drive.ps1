@@ -31,7 +31,7 @@
     Copies files and directories from drive D: to drive E:, verifying the integrity of copied files.
 
 .NOTES
-    Author: Jeff Ricica
+    Author: jricica2
     Date: 2025-04-22
     Version: 1.0
     This script requires administrative privileges to run.
@@ -91,31 +91,25 @@ try {
             $copiedItems++
         }
         else {
-            # Check if file exists and should be skipped
-            $shouldCopy = $true
-            
+            # Optimized SkipExisting logic
             if ($SkipExisting -and (Test-Path -Path $destPath)) {
                 $destItem = Get-Item -Path $destPath
-                
-                # Skip if file exists and has same length and write time
                 if ($item.Length -eq $destItem.Length -and $item.LastWriteTime -eq $destItem.LastWriteTime) {
-                    $shouldCopy = $false
                     $skippedItems++
                     Show-Progress -Activity "Processing items" -Status "Skipping $($item.Name) - $currentItem of $totalItems ($percentComplete%)" -PercentComplete $percentComplete
+                    continue
                 }
             }
             
-            if ($shouldCopy) {
-                # Copy file
-                $destDir = Split-Path -Path $destPath -Parent
-                if (-not (Test-Path -Path $destDir)) {
-                    New-Item -Path $destDir -ItemType Directory -Force | Out-Null
-                }
-                
-                Copy-Item -Path $item.FullName -Destination $destPath -Force
-                $copiedItems++
-                Show-Progress -Activity "Processing items" -Status "Copying $($item.Name) - $currentItem of $totalItems ($percentComplete%)" -PercentComplete $percentComplete
+            # Copy file
+            $destDir = Split-Path -Path $destPath -Parent
+            if (-not (Test-Path -Path $destDir)) {
+                New-Item -Path $destDir -ItemType Directory -Force | Out-Null
             }
+            
+            Copy-Item -Path $item.FullName -Destination $destPath -Force
+            $copiedItems++
+            Show-Progress -Activity "Processing items" -Status "Copying $($item.Name) - $currentItem of $totalItems ($percentComplete%)" -PercentComplete $percentComplete
         }
     }
     
