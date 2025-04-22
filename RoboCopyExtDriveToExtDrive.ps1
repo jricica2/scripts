@@ -1,6 +1,6 @@
 # Script to copy all data from a smaller NVMe SSD to a larger one
-# Context to run:
-# .\Copy-NVMeDrive.ps1 -SourceDrive "D:" -DestinationDrive "E:" -Verify
+# Usage context:
+# .\RoboCopyExtDriveToExtDrive.ps1 -SourceDrive "D:" -DestinationDrive "E:" -Verify -SkipExisting
 
 # Define parameters
 param (
