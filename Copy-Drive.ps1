@@ -1,6 +1,42 @@
-# Script to copy all data from a smaller NVMe SSD to a larger one
-# Usage Context:
-# .\Copy-Drive.ps1 -SourceDrive "D:" -DestinationDrive "E:" -SkipExisting OR -SkipExisting:$true
+<#
+.SYNOPSIS
+    Script to copy all data from a smaller NVMe SSD to a larger one.
+
+.DESCRIPTION
+    This script recursively copies all files and directories from a source drive to a destination drive.
+    It includes options to verify copied files, skip existing files, and display progress during the operation.
+
+.PARAMETER SourceDrive
+    The drive letter of the source drive (e.g., "D:"). This parameter is mandatory.
+
+.PARAMETER DestinationDrive
+    The drive letter of the destination drive (e.g., "E:"). This parameter is mandatory.
+
+.PARAMETER Verify
+    Optional switch to verify the copied files. If specified, the script ensures the integrity of copied files.
+
+.PARAMETER SkipExisting
+    Optional switch to skip files that already exist in the destination drive with matching size and write time.
+
+.EXAMPLE
+    .\Copy-Drive.ps1 -SourceDrive "D:" -DestinationDrive "E:"
+    Copies all files and directories from drive D: to drive E:.
+
+.EXAMPLE
+    .\Copy-Drive.ps1 -SourceDrive "D:" -DestinationDrive "E:" -SkipExisting
+    Copies files and directories from drive D: to drive E:, skipping files that already exist.
+
+.EXAMPLE
+    .\Copy-Drive.ps1 -SourceDrive "D:" -DestinationDrive "E:" -Verify
+    Copies files and directories from drive D: to drive E:, verifying the integrity of copied files.
+
+.NOTES
+    Author: Jeff Ricica
+    Date: 2025-04-22
+    Version: 1.0
+    This script requires administrative privileges to run.
+
+#>
 
 # Define parameters
 param (
