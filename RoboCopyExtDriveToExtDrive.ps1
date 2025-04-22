@@ -1,5 +1,5 @@
 # Script to copy all data from a smaller NVMe SSD to a larger one
-# Usage context:
+# Usage Context:
 # .\RoboCopyExtDriveToExtDrive.ps1 -SourceDrive "D:" -DestinationDrive "E:" -Verify -SkipExisting
 
 # Define parameters
@@ -11,7 +11,10 @@ param (
     [string]$DestinationDrive,
     
     [Parameter(Mandatory=$false)]
-    [switch]$Verify = $false
+    [switch]$Verify = $false,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$SkipExisting = $false
 )
 
 # Function to display progress
@@ -59,6 +62,9 @@ catch {
 
 # Confirm operation
 Write-Host "`nThis will copy all data from $SourceDrive to $DestinationDrive." -ForegroundColor Yellow
+if ($SkipExisting) {
+    Write-Host "Existing files on the destination drive will be skipped." -ForegroundColor Yellow
+}
 $confirmation = Read-Host "Are you sure you want to proceed? (y/n)"
 if ($confirmation -ne 'y') {
     Write-Host "Operation cancelled by user." -ForegroundColor Red
@@ -74,6 +80,7 @@ try {
     $sourceItems = Get-ChildItem -Path "$SourceDrive\" -Recurse -Force -ErrorAction SilentlyContinue
     $totalItems = $sourceItems.Count
     $copiedItems = 0
+    $skippedItems = 0
     
     # Create destination root if it doesn't exist
     if (-not (Test-Path -Path "$DestinationDrive\")) {
@@ -85,9 +92,8 @@ try {
         $relativePath = $item.FullName.Substring($SourceDrive.Length)
         $destPath = Join-Path -Path $DestinationDrive -ChildPath $relativePath
         
-        $copiedItems++
-        $percentComplete = [math]::Min(100, [math]::Round(($copiedItems / $totalItems) * 100))
-        Show-Progress -Activity "Copying files" -Status "$copiedItems of $totalItems items ($percentComplete%)" -PercentComplete $percentComplete
+        $currentItem = $copiedItems + $skippedItems + 1
+        $percentComplete = [math]::Min(100, [math]::Round(($currentItem / $totalItems) * 100))
         
         try {
             if ($item.PSIsContainer) {
@@ -95,19 +101,39 @@ try {
                 if (-not (Test-Path -Path $destPath)) {
                     New-Item -Path $destPath -ItemType Directory -Force | Out-Null
                 }
+                $copiedItems++
+                Show-Progress -Activity "Processing items" -Status "$currentItem of $totalItems items ($percentComplete%) - Creating directory" -PercentComplete $percentComplete
             }
             else {
-                # Copy file
-                $destDir = Split-Path -Path $destPath -Parent
-                if (-not (Test-Path -Path $destDir)) {
-                    New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+                # Check if file exists and should be skipped
+                $shouldCopy = $true
+                
+                if ($SkipExisting -and (Test-Path -Path $destPath)) {
+                    $destItem = Get-Item -Path $destPath
+                    
+                    # Skip if file exists and has same length and write time
+                    if ($item.Length -eq $destItem.Length -and $item.LastWriteTime -eq $destItem.LastWriteTime) {
+                        $shouldCopy = $false
+                        $skippedItems++
+                        Show-Progress -Activity "Processing items" -Status "$currentItem of $totalItems items ($percentComplete%) - Skipped existing file" -PercentComplete $percentComplete
+                    }
                 }
                 
-                Copy-Item -Path $item.FullName -Destination $destPath -Force
+                if ($shouldCopy) {
+                    # Copy file
+                    $destDir = Split-Path -Path $destPath -Parent
+                    if (-not (Test-Path -Path $destDir)) {
+                        New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+                    }
+                    
+                    Copy-Item -Path $item.FullName -Destination $destPath -Force
+                    $copiedItems++
+                    Show-Progress -Activity "Processing items" -Status "$currentItem of $totalItems items ($percentComplete%) - Copying file" -PercentComplete $percentComplete
+                }
             }
         }
         catch {
-            Write-Warning "Error copying $($item.FullName): $_"
+            Write-Warning "Error processing $($item.FullName): $_"
         }
     }
     
@@ -116,6 +142,7 @@ try {
         Write-Host "`nVerifying copied files..." -ForegroundColor Yellow
         $verifiedItems = 0
         $failedItems = 0
+        $totalFiles = ($sourceItems | Where-Object { -not $_.PSIsContainer }).Count
         
         foreach ($item in $sourceItems) {
             if (-not $item.PSIsContainer) {
@@ -123,8 +150,8 @@ try {
                 $destPath = Join-Path -Path $DestinationDrive -ChildPath $relativePath
                 
                 $verifiedItems++
-                $percentComplete = [math]::Min(100, [math]::Round(($verifiedItems / $totalItems) * 100))
-                Show-Progress -Activity "Verifying files" -Status "$verifiedItems of $totalItems items ($percentComplete%)" -PercentComplete $percentComplete
+                $percentComplete = [math]::Min(100, [math]::Round(($verifiedItems / $totalFiles) * 100))
+                Show-Progress -Activity "Verifying files" -Status "$verifiedItems of $totalFiles files ($percentComplete%)" -PercentComplete $percentComplete
                 
                 if (Test-Path -Path $destPath) {
                     $sourceHash = Get-FileHash -Path $item.FullName -Algorithm SHA256
@@ -156,6 +183,9 @@ try {
     Write-Host "`nCopy process completed at $endTime" -ForegroundColor Green
     Write-Host "Total duration: $($duration.Hours) hours, $($duration.Minutes) minutes, $($duration.Seconds) seconds" -ForegroundColor Green
     Write-Host "Total items copied: $copiedItems" -ForegroundColor Green
+    if ($SkipExisting) {
+        Write-Host "Total items skipped: $skippedItems" -ForegroundColor Green
+    }
 }
 catch {
     Write-Error "Error during copy process: $_"
