@@ -144,23 +144,23 @@ function Show-InteractiveMenu {
         return @()
     }
 
-    # Convert items to menu format - explicitly copy properties to avoid reference issues
+    # Convert items to menu format - copy ALL properties to avoid losing data
     $menuItems = @()
     foreach ($item in $Items) {
         if ($item -is [string]) {
             $menuItems += @{ Name = $item; Selected = $false; SizeStr = "" }
         } else {
-            # Explicitly copy properties to new hashtable (Clone() can be unreliable)
+            # Copy all properties from the original hashtable
             $newItem = @{
-                Name = if ($item.Name) { $item.Name.ToString() } else { "Unknown" }
-                Selected = [bool]$item.Selected
-                Path = if ($item.Path) { $item.Path.ToString() } else { $null }
-                SizeStr = ""  # Will be calculated once below
+                SizeStr = ""  # Will be calculated once below if ShowSize is true
             }
-            # Copy any additional properties
-            if ($item.RelativeName) { $newItem.RelativeName = $item.RelativeName.ToString() }
-            if ($item.Value) { $newItem.Value = $item.Value }
-            if ($item.Exists) { $newItem.Exists = $item.Exists }
+            # Copy every property from the source item
+            foreach ($key in $item.Keys) {
+                $newItem[$key] = $item[$key]
+            }
+            # Ensure required properties exist with defaults
+            if (-not $newItem.Name) { $newItem.Name = "Unknown" }
+            if (-not $newItem.ContainsKey('Selected')) { $newItem.Selected = $false }
             $menuItems += $newItem
         }
     }
@@ -629,40 +629,22 @@ function Get-FolderSize {
     param([string]$Path)
 
     if (-not $Path) {
-        Write-Host " [DEBUG: Path is empty]" -ForegroundColor Magenta -NoNewline
         return 0
     }
 
-    # Test if path exists using both methods
-    $existsLiteral = Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue
-    $existsNormal = Test-Path -Path $Path -ErrorAction SilentlyContinue
-
-    if (-not $existsLiteral -and -not $existsNormal) {
-        Write-Host " [DEBUG: Path not found: Literal=$existsLiteral Normal=$existsNormal]" -ForegroundColor Magenta -NoNewline
+    # Test if path exists using LiteralPath (handles special characters)
+    if (-not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
         return 0
     }
 
     try {
-        # Try LiteralPath first, then fall back to Path
-        $files = $null
-        if ($existsLiteral) {
-            $files = Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue
-        } elseif ($existsNormal) {
-            $files = Get-ChildItem -Path $Path -Recurse -File -ErrorAction SilentlyContinue
-        }
-
-        $fileCount = 0
-        if ($files) { $fileCount = @($files).Count }
-
-        if ($files -and $fileCount -gt 0) {
+        $files = Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue
+        if ($files) {
             $size = ($files | Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
-            Write-Host " [DEBUG: $fileCount files, Sum=$size]" -ForegroundColor Magenta -NoNewline
-            if ($size) { return $size } else { return 0 }
+            if ($size) { return $size }
         }
-        Write-Host " [DEBUG: No files found, Count=$fileCount]" -ForegroundColor Magenta -NoNewline
         return 0
     } catch {
-        Write-Host " [DEBUG: Exception: $($_.Exception.Message)]" -ForegroundColor Magenta -NoNewline
         return 0
     }
 }
@@ -1540,27 +1522,21 @@ function Invoke-RobocopyWithProgress {
     if ($exitCode -lt 8) {
         $results.Success = $true
 
-        # Extract stats from output - try multiple patterns
-        # Pattern 1: "Files : 123" (with /BYTES flag)
-        # Pattern 2: After "Copied" column in summary table
-        if ($output -match "Files\s*:\s*\d+\s+(\d+)") {
-            # This matches "Files :    123    45" and captures the Copied column (45)
-            $results.FilesCopied = [int]$Matches[1]
-        } elseif ($output -match "Files\s*:\s*(\d+)") {
-            $results.FilesCopied = [int]$Matches[1]
-        }
+        # Note: When using /LOG+:, RoboCopy output goes to log file, not stdout
+        # So we use the pre-calculated source file count and size as the result
+        # The exit code confirms the copy succeeded
+        $results.FilesCopied = $totalFiles
+        $results.BytesCopied = if ($totalSize) { $totalSize } else { 0 }
 
-        # Try to extract bytes - RoboCopy summary format varies
-        if ($output -match "Bytes\s*:\s*\d+\s+(\d+)") {
-            # Captures the Copied bytes column
-            $results.BytesCopied = [int64]$Matches[1]
-        } elseif ($output -match "Bytes\s*:\s*(\d+)") {
-            $results.BytesCopied = [int64]$Matches[1]
-        }
-
-        # If we still have 0 bytes but files were copied, use the source size as estimate
-        if ($results.BytesCopied -eq 0 -and $totalSize -gt 0) {
-            $results.BytesCopied = $totalSize
+        # Try to parse stdout if available (may have partial info without /LOG)
+        if ($output -and $output.Length -gt 100) {
+            # Try to extract actual copied count from RoboCopy summary
+            if ($output -match "Files\s*:\s*\d+\s+(\d+)") {
+                $results.FilesCopied = [int]$Matches[1]
+            }
+            if ($output -match "Bytes\s*:\s*\d+\s+(\d+)") {
+                $results.BytesCopied = [int64]$Matches[1]
+            }
         }
     } else {
         $results.Success = $false
@@ -1709,15 +1685,6 @@ function Invoke-BackupOperation {
         }
     }
 
-    # Debug: Show what folders were selected and their paths
-    Write-Host ""
-    Write-Host "DEBUG: Selected folders:" -ForegroundColor Magenta
-    foreach ($f in $selectedFolders) {
-        Write-Host "  Name: '$($f.Name)' Path: '$($f.Path)'" -ForegroundColor Magenta
-    }
-    Write-Host "Press any key to continue..." -ForegroundColor Magenta
-    $null = [Console]::ReadKey($true)
-
     # Parse selected options
     $backupAppConfigs = ($selectedOptions | Where-Object { $_.Name -match "application configs" }).Count -gt 0
     $backupWallpaper = ($selectedOptions | Where-Object { $_.Name -match "wallpaper" }).Count -gt 0
@@ -1737,30 +1704,18 @@ function Invoke-BackupOperation {
 
     foreach ($folder in $selectedFolders) {
         $folderPath = $folder.Path
-        Write-Host "  Calculating $($folder.Name)..." -ForegroundColor Cyan
-        Write-Host "    Path: '$folderPath'" -ForegroundColor Magenta
 
-        # Debug: show path if empty
         if (-not $folderPath) {
-            Write-Host "    [ERROR: No path!]" -ForegroundColor Red
+            Write-Warning "  $($folder.Name): No path found, skipping"
             continue
         }
 
-        # Debug: Test path directly here
-        $testLiteral = Test-Path -LiteralPath $folderPath -ErrorAction SilentlyContinue
-        $testNormal = Test-Path -Path $folderPath -ErrorAction SilentlyContinue
-        Write-Host "    Test-Path: Literal=$testLiteral Normal=$testNormal" -ForegroundColor Magenta
-
+        Write-Host "  $($folder.Name)..." -NoNewline -ForegroundColor Cyan
         $size = Get-FolderSize -Path $folderPath
-        Write-Host "    Returned size: $size" -ForegroundColor Magenta
         $folderSizes[$folder.Name] = $size
         $totalSize += $size
-        Write-Host "    Formatted: $(Format-Size $size)" -ForegroundColor DarkGray
+        Write-Host " $(Format-Size $size)" -ForegroundColor DarkGray
     }
-
-    Write-Host ""
-    Write-Host "DEBUG: Press any key to continue to summary..." -ForegroundColor Yellow
-    $null = [Console]::ReadKey($true)
 
     # Check destination space
     $destDrive = Split-Path $basePath -Qualifier
@@ -1834,10 +1789,20 @@ function Invoke-BackupOperation {
     New-Item -Path $personalizationFolder -ItemType Directory -Force | Out-Null
     New-Item -Path $logsFolder -ItemType Directory -Force | Out-Null
 
-    # Initialize logging
-    $logFile = Join-Path $logsFolder "backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    # Initialize logging - separate files for readable script log and RoboCopy technical log
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $logFile = Join-Path $logsFolder "backup_$timestamp.log"
+    $robocopyLogFile = Join-Path $logsFolder "backup_robocopy_$timestamp.log"
     $errorLog = @()
     $skipLog = @()
+
+    # Initialize script log
+    "========================================" | Out-File -FilePath $logFile -Force -Encoding UTF8
+    "Backup Log - $(Get-Date)" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "Computer: $hostname" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "Destination: $backupFolder" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "========================================" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "" | Out-File -FilePath $logFile -Append -Encoding UTF8
 
     # Step 5: Execute backup
     Write-Header "EXECUTING BACKUP"
@@ -1864,10 +1829,15 @@ function Invoke-BackupOperation {
             Write-Section "Backing up $($folder.Name)"
             Write-Host "  Source: $sourcePath" -ForegroundColor DarkGray
 
-            $result = Invoke-RobocopyWithProgress -Source $sourcePath -Destination $destPath -LogFile $logFile
+            "Processing: $($folder.Name)" | Out-File -FilePath $logFile -Append -Encoding UTF8
+            "  Source: $sourcePath" | Out-File -FilePath $logFile -Append -Encoding UTF8
+            "  Destination: $destPath" | Out-File -FilePath $logFile -Append -Encoding UTF8
+
+            $result = Invoke-RobocopyWithProgress -Source $sourcePath -Destination $destPath -LogFile $robocopyLogFile
 
             if ($result.Success) {
                 Write-Success "$($folder.Name) - $(Format-Size $result.BytesCopied) copied"
+                "SUCCESS: $($folder.Name) - $($result.FilesCopied) files, $(Format-Size $result.BytesCopied)" | Out-File -FilePath $logFile -Append -Encoding UTF8
                 $manifest.Folders += @{
                     Name = $folder.Name
                     SourcePath = $folder.Path
@@ -1877,6 +1847,10 @@ function Invoke-BackupOperation {
                 }
             } else {
                 Write-Warning "$($folder.Name) completed with errors"
+                "WARNING: $($folder.Name) completed with errors" | Out-File -FilePath $logFile -Append -Encoding UTF8
+                foreach ($err in $result.Errors) {
+                    "  - $err" | Out-File -FilePath $logFile -Append -Encoding UTF8
+                }
                 $errorLog += $result.Errors
             }
         }
@@ -2037,9 +2011,15 @@ Write-Host "Some applications may require a restart to complete installation." -
     # Save error log if any
     if ($errorLog.Count -gt 0) {
         $errorLogPath = Join-Path $logsFolder "errors.log"
-        $errorLog | Out-File -FilePath $errorLogPath
+        $errorLog | Out-File -FilePath $errorLogPath -Encoding UTF8
         Write-Warning "Some errors occurred. See: $errorLogPath"
     }
+
+    # Write completion to log
+    "" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "========================================" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "Backup completed: $(Get-Date)" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "========================================" | Out-File -FilePath $logFile -Append -Encoding UTF8
 
     # Final summary
     Write-Header "BACKUP COMPLETE"
@@ -2056,6 +2036,11 @@ Write-Host "Some applications may require a restart to complete installation." -
     if (Test-Path (Join-Path $backupFolder "AppReinstall.ps1")) {
         Write-Host "    - AppReinstall.ps1 : Application reinstall script"
     }
+
+    Write-Host ""
+    Write-Host "  Log files:" -ForegroundColor DarkGray
+    Write-Host "    Script log:   $logFile" -ForegroundColor DarkGray
+    Write-Host "    RoboCopy log: $robocopyLogFile" -ForegroundColor DarkGray
 
     Write-Host ""
     Write-Host "  Next Steps:" -ForegroundColor Cyan
@@ -2186,15 +2171,50 @@ function Invoke-RestoreOperation {
 
     $restoreOptions = @()
 
-    # Find available folders
+    # Find available folders and resolve correct destination paths
     if (Test-Path $userDataPath) {
         Get-ChildItem -Path $userDataPath -Directory | ForEach-Object {
+            $folderName = $_.Name
+            $destPath = $null
+
+            # First, try to get the original SourcePath from manifest
+            if ($manifest -and $manifest.Folders) {
+                $manifestEntry = $manifest.Folders | Where-Object {
+                    $_.Name -eq $folderName -or $_.BackupPath -eq $folderName
+                } | Select-Object -First 1
+
+                if ($manifestEntry -and $manifestEntry.SourcePath) {
+                    # Check if the original path still exists (same machine or similar setup)
+                    if (Test-Path $manifestEntry.SourcePath -ErrorAction SilentlyContinue) {
+                        $destPath = $manifestEntry.SourcePath
+                    }
+                }
+            }
+
+            # If no manifest path, try to resolve using Windows special folders
+            if (-not $destPath) {
+                # Map folder names to special folder detection
+                $folderDef = $script:DefaultFolders | Where-Object { $_.Name -eq $folderName } | Select-Object -First 1
+                if ($folderDef) {
+                    $resolvedPath = Get-SpecialFolderPath -FolderName $folderDef.Name -SpecialFolder $folderDef.SpecialFolder -KnownFolder $folderDef.KnownFolder
+                    if ($resolvedPath) {
+                        $destPath = $resolvedPath
+                    }
+                }
+            }
+
+            # Final fallback: use user profile + folder name
+            if (-not $destPath) {
+                $destPath = Join-Path $userProfile $folderName
+            }
+
             $restoreOptions += @{
-                Name = "User Data: $($_.Name)"
+                Name = "User Data: $folderName"
                 Selected = $true
                 Type = "UserData"
                 Path = $_.FullName
-                FolderName = $_.Name
+                FolderName = $folderName
+                DestPath = $destPath
             }
         }
     }
@@ -2240,22 +2260,85 @@ function Invoke-RestoreOperation {
         return
     }
 
+    # Step 3: Restore options
+    Write-Section "Restore Options"
+
+    $restoreOptionsMenu = @(
+        @{ Name = "Restore to original locations"; Selected = $true },
+        @{ Name = "Restore to alternate folder (for testing)"; Selected = $false },
+        @{ Name = "Dry run (show what would happen, no actual copy)"; Selected = $false }
+    )
+
+    $selectedRestoreOptions = Show-InteractiveMenu -Title "Restore Options" -Items $restoreOptionsMenu -MultiSelect $true
+
+    if ($null -eq $selectedRestoreOptions) {
+        Write-Warning "Operation cancelled."
+        return
+    }
+
+    $dryRun = ($selectedRestoreOptions | Where-Object { $_.Name -match "Dry run" }).Count -gt 0
+    $useAlternateLocation = ($selectedRestoreOptions | Where-Object { $_.Name -match "alternate folder" }).Count -gt 0
+    $alternatePath = $null
+
+    if ($useAlternateLocation) {
+        Write-Host ""
+        $alternatePath = Read-Host "Enter alternate restore destination (e.g., C:\RestoreTest)"
+        if (-not $alternatePath) {
+            Write-Warning "No path entered. Operation cancelled."
+            return
+        }
+
+        # Validate/create the alternate path
+        if (-not (Test-Path $alternatePath)) {
+            try {
+                New-Item -Path $alternatePath -ItemType Directory -Force | Out-Null
+                Write-Success "Created test folder: $alternatePath"
+            } catch {
+                Write-Error "Failed to create folder: $_"
+                return
+            }
+        }
+
+        # Update all destination paths to use alternate location
+        foreach ($item in $selectedItems) {
+            if ($item.Type -eq "UserData" -and $item.DestPath) {
+                $item.OriginalDestPath = $item.DestPath
+                $item.DestPath = Join-Path $alternatePath $item.FolderName
+            }
+        }
+    }
+
     # Show summary
     Write-Header "RESTORE SUMMARY"
 
-    Write-Host "  Source:      $backupPath" -ForegroundColor White
-    Write-Host "  Destination: $userProfile" -ForegroundColor White
+    if ($dryRun) {
+        Write-Host "  *** DRY RUN MODE - No files will be copied ***" -ForegroundColor Magenta
+        Write-Host ""
+    }
+
+    if ($useAlternateLocation) {
+        Write-Host "  *** TEST MODE - Restoring to: $alternatePath ***" -ForegroundColor Cyan
+        Write-Host ""
+    }
+
+    Write-Host "  Source: $backupPath" -ForegroundColor White
     Write-Host ""
     Write-Host "  Items to restore:" -ForegroundColor Yellow
     foreach ($item in $selectedItems) {
-        Write-Host "    - $($item.Name)"
+        Write-Host "    - $($item.Name)" -ForegroundColor White
+        if ($item.DestPath) {
+            Write-Host "      -> $($item.DestPath)" -ForegroundColor DarkGray
+        }
     }
 
     Write-Host ""
-    Write-Host "  [WARNING] Existing files will be backed up with .bak extension" -ForegroundColor Yellow
-    Write-Host ""
+    if (-not $dryRun -and -not $useAlternateLocation) {
+        Write-Host "  [WARNING] Existing files will be backed up with .bak extension" -ForegroundColor Yellow
+        Write-Host ""
+    }
 
-    if (-not (Show-Confirmation -Message "Proceed with restore?")) {
+    $confirmMessage = if ($dryRun) { "Proceed with dry run?" } else { "Proceed with restore?" }
+    if (-not (Show-Confirmation -Message $confirmMessage)) {
         Write-Warning "Restore cancelled."
         return
     }
@@ -2263,85 +2346,204 @@ function Invoke-RestoreOperation {
     # Execute restore
     Write-Header "EXECUTING RESTORE"
 
+    # Create logs folder
     $logsFolder = Join-Path $userProfile "Logs"
     if (-not (Test-Path $logsFolder)) {
-        New-Item -Path $logsFolder -ItemType Directory -Force | Out-Null
+        try {
+            New-Item -Path $logsFolder -ItemType Directory -Force | Out-Null
+            Write-Info "Created logs folder: $logsFolder"
+        } catch {
+            Write-Warning "Could not create logs folder: $logsFolder"
+            $logsFolder = $env:TEMP
+        }
     }
-    $logFile = Join-Path $logsFolder "restore_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+    # Use separate log files - script log (readable) and RoboCopy log (technical)
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $logFile = Join-Path $logsFolder "restore_$timestamp.log"
+    $robocopyLogFile = Join-Path $logsFolder "restore_robocopy_$timestamp.log"
+
+    # Initialize script log file with UTF8 encoding for readability
+    "========================================" | Out-File -FilePath $logFile -Force -Encoding UTF8
+    "Restore Log - $(Get-Date)" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "========================================" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "Backup source: $backupPath" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "" | Out-File -FilePath $logFile -Append -Encoding UTF8
 
     $restoreResults = @()
 
+    # Verify selected items have required properties
+    Write-Host ""
+    Write-Host "  Processing $($selectedItems.Count) items..." -ForegroundColor DarkGray
+
     foreach ($item in $selectedItems) {
+        # Check for missing Type property (indicates menu didn't preserve properties)
+        if (-not $item.Type) {
+            Write-Warning "Item '$($item.Name)' is missing Type property - skipping"
+            "ERROR: Item missing Type property: $($item.Name)" | Out-File -FilePath $logFile -Append -Encoding UTF8
+            continue
+        }
+
         switch ($item.Type) {
             "UserData" {
-                Write-Section "Restoring $($item.FolderName)"
-                $destPath = Join-Path $userProfile $item.FolderName
+                $folderName = if ($item.FolderName) { $item.FolderName } else { $item.Name -replace "^User Data: ", "" }
+                $destPath = $item.DestPath
 
-                $result = Invoke-RobocopyWithProgress -Source $item.Path -Destination $destPath -LogFile $logFile -Mirror $false
+                Write-Section "Restoring $folderName"
 
-                if ($result.Success) {
-                    Write-Success "$($item.FolderName) restored successfully"
-                    $restoreResults += @{ Name = $item.FolderName; Success = $true }
+                # Validate we have required paths
+                if (-not $item.Path) {
+                    Write-Error "Source path is missing for $folderName"
+                    "ERROR: Missing source path for $folderName" | Out-File -FilePath $logFile -Append -Encoding UTF8
+                    $restoreResults += @{ Name = $folderName; Success = $false; Errors = @("Missing source path") }
+                    continue
+                }
+
+                if (-not $destPath) {
+                    Write-Error "Destination path is missing for $folderName"
+                    "ERROR: Missing destination path for $folderName" | Out-File -FilePath $logFile -Append -Encoding UTF8
+                    $restoreResults += @{ Name = $folderName; Success = $false; Errors = @("Missing destination path") }
+                    continue
+                }
+
+                Write-Host "  Source:      $($item.Path)" -ForegroundColor DarkGray
+                Write-Host "  Destination: $destPath" -ForegroundColor DarkGray
+                "Processing: $folderName" | Out-File -FilePath $logFile -Append -Encoding UTF8
+                "  Source: $($item.Path)" | Out-File -FilePath $logFile -Append -Encoding UTF8
+                "  Destination: $destPath" | Out-File -FilePath $logFile -Append -Encoding UTF8
+
+                if ($dryRun) {
+                    # Count files that would be copied
+                    $fileCount = (Get-ChildItem -LiteralPath $item.Path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
+                    $size = Get-FolderSize -Path $item.Path
+                    Write-Info "[DRY RUN] Would copy $fileCount files ($(Format-Size $size))"
+                    "[DRY RUN] $folderName : $fileCount files, $(Format-Size $size)" | Out-File -FilePath $logFile -Append -Encoding UTF8
+                    $restoreResults += @{ Name = $folderName; Success = $true; DryRun = $true; FileCount = $fileCount }
                 } else {
-                    Write-Warning "$($item.FolderName) restored with some errors"
-                    $restoreResults += @{ Name = $item.FolderName; Success = $false; Errors = $result.Errors }
+                    # Create destination directory if it doesn't exist
+                    if (-not (Test-Path $destPath)) {
+                        try {
+                            New-Item -Path $destPath -ItemType Directory -Force | Out-Null
+                            Write-Info "Created destination folder: $destPath"
+                        } catch {
+                            Write-Error "Failed to create destination folder: $_"
+                            "ERROR: Failed to create destination: $_" | Out-File -FilePath $logFile -Append -Encoding UTF8
+                            $restoreResults += @{ Name = $folderName; Success = $false; Errors = @("Failed to create destination: $_") }
+                            continue
+                        }
+                    }
+
+                    # Use separate RoboCopy log file to avoid encoding issues
+                    $result = Invoke-RobocopyWithProgress -Source $item.Path -Destination $destPath -LogFile $robocopyLogFile -Mirror $false
+
+                    if ($result.Success) {
+                        Write-Success "$folderName restored successfully ($($result.FilesCopied) files, $(Format-Size $result.BytesCopied))"
+                        "SUCCESS: $folderName - $($result.FilesCopied) files, $(Format-Size $result.BytesCopied)" | Out-File -FilePath $logFile -Append -Encoding UTF8
+                        $restoreResults += @{ Name = $folderName; Success = $true; FilesCopied = $result.FilesCopied }
+                    } else {
+                        Write-Warning "$folderName restore had errors"
+                        "WARNING: $folderName restore had errors" | Out-File -FilePath $logFile -Append -Encoding UTF8
+                        foreach ($err in $result.Errors) {
+                            Write-Host "    $err" -ForegroundColor Red
+                            "  - $err" | Out-File -FilePath $logFile -Append -Encoding UTF8
+                        }
+                        $restoreResults += @{ Name = $folderName; Success = $false; Errors = $result.Errors }
+                    }
                 }
             }
             "AppConfigs" {
                 Write-Section "Restoring Application Configurations"
-                $configResults = Restore-AllAppConfigs -SourceFolder $item.Path
-                $restoreResults += @{ Name = "App Configs"; Success = $true; Details = $configResults }
+                if ($dryRun) {
+                    Write-Info "[DRY RUN] Would restore application configurations"
+                    $restoreResults += @{ Name = "App Configs"; Success = $true; DryRun = $true }
+                } else {
+                    $configResults = Restore-AllAppConfigs -SourceFolder $item.Path
+                    $restoreResults += @{ Name = "App Configs"; Success = $true; Details = $configResults }
+                }
             }
             "TaskbarPins" {
                 Write-Section "Restoring Taskbar Pins"
-                $result = Restore-TaskbarPins -SourceFolder $item.Path
-                if ($result.Success) {
-                    Write-Success "Taskbar pins restored ($($result.Restored) items)"
-                    $restoreResults += @{ Name = "Taskbar Pins"; Success = $true }
+                if ($dryRun) {
+                    $pinCount = (Get-ChildItem -Path $item.Path -Filter "*.lnk" -ErrorAction SilentlyContinue | Measure-Object).Count
+                    Write-Info "[DRY RUN] Would restore $pinCount taskbar pins"
+                    $restoreResults += @{ Name = "Taskbar Pins"; Success = $true; DryRun = $true }
                 } else {
-                    Write-Warning "Taskbar pins: $($result.Error)"
-                    $restoreResults += @{ Name = "Taskbar Pins"; Success = $false }
+                    $result = Restore-TaskbarPins -SourceFolder $item.Path
+                    if ($result.Success) {
+                        Write-Success "Taskbar pins restored ($($result.Restored) items)"
+                        $restoreResults += @{ Name = "Taskbar Pins"; Success = $true }
+                    } else {
+                        Write-Warning "Taskbar pins: $($result.Error)"
+                        $restoreResults += @{ Name = "Taskbar Pins"; Success = $false }
+                    }
                 }
             }
             "Wallpaper" {
                 Write-Section "Restoring Wallpaper"
-                $result = Restore-Wallpaper -WallpaperPath $item.Path
-                if ($result.Success) {
-                    Write-Success "Wallpaper restored and applied"
-                    $restoreResults += @{ Name = "Wallpaper"; Success = $true }
+                if ($dryRun) {
+                    Write-Info "[DRY RUN] Would restore wallpaper from: $($item.Path)"
+                    $restoreResults += @{ Name = "Wallpaper"; Success = $true; DryRun = $true }
                 } else {
-                    Write-Warning "Wallpaper: $($result.Error)"
-                    $restoreResults += @{ Name = "Wallpaper"; Success = $false }
+                    $result = Restore-Wallpaper -WallpaperPath $item.Path
+                    if ($result.Success) {
+                        Write-Success "Wallpaper restored and applied"
+                        $restoreResults += @{ Name = "Wallpaper"; Success = $true }
+                    } else {
+                        Write-Warning "Wallpaper: $($result.Error)"
+                        $restoreResults += @{ Name = "Wallpaper"; Success = $false }
+                    }
                 }
             }
         }
     }
 
     # Final summary
-    Write-Header "RESTORE COMPLETE"
+    if ($dryRun) {
+        Write-Header "DRY RUN COMPLETE"
+        Write-Host "  No files were actually copied." -ForegroundColor Magenta
+        Write-Host ""
+    } else {
+        Write-Header "RESTORE COMPLETE"
+    }
 
     Write-Host "  Results:" -ForegroundColor Yellow
     foreach ($result in $restoreResults) {
         $status = if ($result.Success) { "[OK]" } else { "[WARN]" }
         $color = if ($result.Success) { "Green" } else { "Yellow" }
-        Write-Host "    $status $($result.Name)" -ForegroundColor $color
+        $suffix = if ($result.DryRun) { " (dry run)" } else { "" }
+        Write-Host "    $status $($result.Name)$suffix" -ForegroundColor $color
     }
 
-    Write-Host ""
-    Write-Host "  Log file: $logFile" -ForegroundColor DarkGray
-    Write-Host ""
-    Write-Host "  Next Steps:" -ForegroundColor Cyan
-    Write-Host "    1. Review any warnings above"
+    # Write completion to log
+    "" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "========================================" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "Restore completed: $(Get-Date)" | Out-File -FilePath $logFile -Append -Encoding UTF8
+    "========================================" | Out-File -FilePath $logFile -Append -Encoding UTF8
 
-    $reinstallScript = Join-Path $backupPath "AppReinstall.ps1"
-    if (Test-Path $reinstallScript) {
-        Write-Host "    2. Run AppReinstall.ps1 to reinstall applications:"
-        Write-Host "       $reinstallScript" -ForegroundColor DarkGray
-        Write-Host "    3. After apps are installed, taskbar pins should work"
+    if (-not $dryRun) {
+        Write-Host ""
+        Write-Host "  Log files:" -ForegroundColor DarkGray
+        Write-Host "    Script log:   $logFile" -ForegroundColor DarkGray
+        Write-Host "    RoboCopy log: $robocopyLogFile" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  Next Steps:" -ForegroundColor Cyan
+        Write-Host "    1. Review any warnings above"
+
+        $reinstallScript = Join-Path $backupPath "AppReinstall.ps1"
+        if (Test-Path $reinstallScript) {
+            Write-Host "    2. Run AppReinstall.ps1 to reinstall applications:"
+            Write-Host "       $reinstallScript" -ForegroundColor DarkGray
+            Write-Host "    3. After apps are installed, taskbar pins should work"
+        }
+
+        Write-Host "    4. Sign in to browsers to sync remaining data"
+        Write-Host "    5. Restart if prompted by any applications"
+    } else {
+        Write-Host ""
+        Write-Host "  Log file: $logFile" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  To perform the actual restore, run again without dry run option." -ForegroundColor Cyan
     }
-
-    Write-Host "    4. Sign in to browsers to sync remaining data"
-    Write-Host "    5. Restart if prompted by any applications"
     Write-Host ""
 }
 
